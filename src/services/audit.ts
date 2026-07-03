@@ -1,7 +1,18 @@
 import { db } from "../db/client.js";
 import { memoryAudit } from "../db/schema.js";
 
-export type AuditAction = "capture" | "update" | "review" | "delete" | "supersede";
+export type AuditAction =
+  | "capture"
+  | "update"
+  | "review"
+  | "delete"
+  | "restore"
+  | "supersede"
+  | "link_derived"
+  // Compensating action for link removal — without it the append-only log can
+  // assert lineage/links that no longer exist (the 2026-06-13 backfill cleanup
+  // deleted ~4.4k links with no audit trace).
+  | "unlink";
 
 export interface AuditEntry {
   memoryId: string;

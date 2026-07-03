@@ -205,6 +205,16 @@ export async function syncMailSource(source: SourceRow): Promise<{ ingested: num
 
       const content = `# ${subject}\n\nFrom: ${from}\nDate: ${date}\nAccount: ${account}\nLabels: ${(msg.labelIds ?? []).join(", ") || "(none)"}\n\n---\n\n${body}`;
 
+      // internalDate is Gmail's ms-epoch receipt time; fall back to the Date
+      // header. Either way the memory carries when the mail arrived, not when
+      // the poll happened to run.
+      const internalMs = Number(msg.internalDate);
+      const receivedAt = Number.isFinite(internalMs) && internalMs > 0
+        ? new Date(internalMs).toISOString()
+        : !Number.isNaN(Date.parse(date))
+          ? new Date(date).toISOString()
+          : undefined;
+
       await storeMemory(
         {
           content,
@@ -212,6 +222,7 @@ export async function syncMailSource(source: SourceRow): Promise<{ ingested: num
           sourceId: msg.id,
           memoryType: "fact",
           tags: msg.labelIds ?? [],
+          sourceDate: receivedAt,
         },
         { createdBy: "import" },
       );

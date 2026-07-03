@@ -15,8 +15,16 @@ export const SearchMemorySchema = z.object({
     .optional()
     .describe("Filter by source (e.g. claude-code, manual, web, youtube)"),
   tags: z.array(z.string()).optional().describe("Filter by tags (AND)"),
-  after: z.string().optional().describe("Only memories after this ISO date"),
-  before: z.string().optional().describe("Only memories before this ISO date"),
+  after: z
+    .string()
+    .refine((v) => !Number.isNaN(Date.parse(v)), "must be an ISO 8601 date")
+    .optional()
+    .describe("Only memories after this ISO date (e.g. 2026-01-31 or 2026-01-31T12:00:00Z)"),
+  before: z
+    .string()
+    .refine((v) => !Number.isNaN(Date.parse(v)), "must be an ISO 8601 date")
+    .optional()
+    .describe("Only memories before this ISO date (e.g. 2026-01-31 or 2026-01-31T12:00:00Z)"),
   threshold: z
     .number()
     .min(0)
@@ -106,6 +114,7 @@ export async function searchMemory(input: SearchMemoryInput) {
     SELECT id, content, summary, source, source_id, memory_type, tags, entities,
            created_at, updated_at,
            provenance_status, review_status, can_use_as_instruction,
+           created_by, confidence, visibility,
            ${simExpr} AS similarity,
            ${scoreExpr} AS score
     FROM memories
@@ -132,22 +141,47 @@ export async function searchMemory(input: SearchMemoryInput) {
     provenanceStatus: r.provenance_status,
     reviewStatus: r.review_status,
     canUseAsInstruction: r.can_use_as_instruction,
+    createdBy: r.created_by,
+    confidence: r.confidence != null ? Number(r.confidence) : null,
+    visibility: r.visibility,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     linkedMemories: [] as { id: string; similarity: number }[],
+    // Lineage (derived_from links). A derivative carries `derivedFrom` pointers to
+    // the source(s) it was produced from; a source carries `derivatives`.
+    derivedFrom: [] as { id: string; similarity: number }[],
+    derivatives: [] as { id: string; similarity: number }[],
   }));
 
   // Fetch linked memories for search results
   if (results.length > 0) {
     try {
       const ids = results.map((r: any) => r.id);
+      const byId = new Map(results.map((r: any) => [r.id, r]));
       const links = await pg.unsafe(`
-        SELECT source_memory_id, target_memory_id, similarity
+        SELECT source_memory_id, target_memory_id, similarity, relationship
         FROM memory_links
         WHERE source_memory_id = ANY($1) OR target_memory_id = ANY($1)
       `, [ids]);
 
+      // Sources whose derivative is also in this page get collapsed: the
+      // derivative is canonical (denser, decision-relevant) and the source rides
+      // along as backing evidence, so the source drops out of the top-level list.
+      const collapsed = new Set<string>();
+
       for (const link of links) {
+        if (link.relationship === "derived_from") {
+          // source_memory_id = derivative, target_memory_id = source
+          const deriv = byId.get(link.source_memory_id);
+          const src = byId.get(link.target_memory_id);
+          if (deriv) deriv.derivedFrom.push({ id: link.target_memory_id, similarity: Number(link.similarity) });
+          if (src) {
+            src.derivatives.push({ id: link.source_memory_id, similarity: Number(link.similarity) });
+            if (deriv) collapsed.add(src.id); // both in page → demote the source
+          }
+          continue;
+        }
+        // Plain similarity link: surface the other end only when it's off-page.
         for (const result of results) {
           if (link.source_memory_id === result.id && !ids.includes(link.target_memory_id)) {
             result.linkedMemories.push({ id: link.target_memory_id, similarity: Number(link.similarity) });
@@ -155,6 +189,10 @@ export async function searchMemory(input: SearchMemoryInput) {
             result.linkedMemories.push({ id: link.source_memory_id, similarity: Number(link.similarity) });
           }
         }
+      }
+
+      if (collapsed.size > 0) {
+        return results.filter((r: any) => !collapsed.has(r.id));
       }
     } catch {
       // Links table may not exist yet — graceful degradation

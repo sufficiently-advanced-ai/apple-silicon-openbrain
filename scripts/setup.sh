@@ -31,38 +31,7 @@ fi
 psql openbrain -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null
 echo "  ✓ PostgreSQL ready"
 
-# Schema
-echo "→ Applying schema..."
-psql openbrain -f - <<'SQL'
-CREATE TABLE IF NOT EXISTS memories (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    content     TEXT NOT NULL,
-    summary     TEXT,
-    embedding   vector(1024),
-    source      TEXT,
-    source_id   TEXT,
-    memory_type TEXT,
-    tags        TEXT[],
-    entities    JSONB DEFAULT '{}',
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    source_date TIMESTAMPTZ,
-    expires_at  TIMESTAMPTZ,
-    deleted_at  TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories
-    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
-CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories USING gin (tags);
-CREATE INDEX IF NOT EXISTS idx_memories_entities ON memories USING gin (entities);
-CREATE INDEX IF NOT EXISTS idx_memories_content_fts ON memories
-    USING gin (to_tsvector('english', content));
-CREATE INDEX IF NOT EXISTS idx_memories_source_date ON memories (source_date DESC);
-CREATE INDEX IF NOT EXISTS idx_memories_source_sourceid ON memories (source, source_id);
-SQL
-echo "  ✓ Schema applied"
-
-# Node dependencies via pnpm
+# Node dependencies via pnpm (needed before migrations — migrate.ts uses postgres.js)
 echo "→ Installing dependencies (pnpm)..."
 cd "$REPO_DIR"
 if ! command -v pnpm &>/dev/null; then
@@ -72,6 +41,13 @@ if ! command -v pnpm &>/dev/null; then
 fi
 pnpm install --silent
 echo "  ✓ Dependencies installed"
+
+# Schema: apply ALL migrations (drizzle/*.sql) via the tracked runner. The old
+# inline schema here only covered migration 0000 and shipped broken installs
+# (no governance columns, no memory_links/memory_audit/sources tables).
+echo "→ Applying migrations..."
+bun run src/db/migrate.ts
+echo "  ✓ Schema up to date"
 
 # Python embedding service
 echo "→ Setting up embedding service..."

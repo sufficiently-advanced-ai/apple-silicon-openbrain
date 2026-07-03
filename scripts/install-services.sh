@@ -88,6 +88,7 @@ install_plist() {
 install_plist "com.openbrain.mcp"
 install_plist "com.openbrain.embed"
 install_plist "com.openbrain.ui"
+install_plist "com.openbrain.poll"
 
 if [ -n "$MLX_VENV" ]; then
   install_plist "com.openbrain.llm"

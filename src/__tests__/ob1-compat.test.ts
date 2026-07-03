@@ -7,9 +7,18 @@ import { pg } from "../db/client.js";
 // End-to-end exercise of the OB1-compat tools + governance model against the
 // live local DB/embedding/enrichment services, driven through a real MCP
 // in-memory client (so tool registration in server.ts is covered too).
+//
+// OPT-IN: this suite writes to (and hard-deletes marker rows from) the live
+// `openbrain` database, so the default `bun test` skips it. Run with
+// `bun run test:live` (sets OPENBRAIN_LIVE_TESTS=1).
+const LIVE = process.env.OPENBRAIN_LIVE_TESTS === "1";
 
 const MARKER = `obtest-${Date.now()}`;
 let client: Client;
+
+if (!LIVE) {
+  test.skip("OB1 compat live suite (set OPENBRAIN_LIVE_TESTS=1 to run)", () => {});
+} else {
 
 function textOf(res: any): string {
   return res.content.map((c: any) => c.text).join("\n");
@@ -53,7 +62,7 @@ test("capture_thought stores as evidence, then dedupes on identical content", as
   const content = `${MARKER} the capital of testlandia is bunbury`;
   const first = await call("capture_thought", { content });
   expect(first.toLowerCase()).toContain("evidence");
-  const id = first.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0];
+  const id = first.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] ?? "";
   expect(id).toBeTruthy();
 
   // Governance defaults for an agent capture.
@@ -172,3 +181,5 @@ test("ReviewMemory supersede validates the target", async () => {
   }));
   expect(missing.error).toMatch(/not found/i);
 });
+
+} // end if (LIVE)

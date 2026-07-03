@@ -46,3 +46,6 @@ await Promise.all([
   checkRedis(),
   checkPg(),
 ]);
+
+// Top-level await requires module context under tsc.
+export {};

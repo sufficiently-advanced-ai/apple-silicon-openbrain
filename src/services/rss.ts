@@ -13,6 +13,15 @@ interface RssConfig {
 interface FeedItem {
   link: string;
   title?: string;
+  /** ISO publication date, when the feed provides one. */
+  publishedAt?: string;
+}
+
+/** Parse a feed date field into ISO, or undefined when absent/unparseable. */
+function feedDate(raw: unknown): string | undefined {
+  if (typeof raw !== "string" || !raw.trim()) return undefined;
+  const ms = Date.parse(raw);
+  return Number.isNaN(ms) ? undefined : new Date(ms).toISOString();
 }
 
 const parser = new XMLParser({
@@ -34,10 +43,10 @@ function extractItems(feed: unknown): FeedItem[] {
   if (rssChannel?.item) {
     return rssChannel.item
       .map((raw): FeedItem | null => {
-        const i = raw as { link?: string | { "@_href"?: string }; title?: string };
+        const i = raw as { link?: string | { "@_href"?: string }; title?: string; pubDate?: string };
         const link = typeof i.link === "string" ? i.link : i.link?.["@_href"];
         if (!link) return null;
-        return { link, title: i.title };
+        return { link, title: i.title, publishedAt: feedDate(i.pubDate) };
       })
       .filter((x): x is FeedItem => x !== null);
   }
@@ -47,7 +56,12 @@ function extractItems(feed: unknown): FeedItem[] {
   if (atomEntries) {
     return atomEntries
       .map((raw): FeedItem | null => {
-        const e = raw as { link?: unknown; title?: string | { "#text"?: string } };
+        const e = raw as {
+          link?: unknown;
+          title?: string | { "#text"?: string };
+          published?: string;
+          updated?: string;
+        };
         // Atom <link> can be a string, an object with @_href, or an array of either.
         const links = Array.isArray(e.link) ? e.link : [e.link];
         const linkObj = links.find((l): l is string | { "@_href"?: string; "@_rel"?: string } => l != null);
@@ -57,7 +71,7 @@ function extractItems(feed: unknown): FeedItem[] {
             : (linkObj as { "@_href"?: string; "@_rel"?: string } | undefined)?.["@_href"];
         if (!href) return null;
         const title = typeof e.title === "string" ? e.title : e.title?.["#text"];
-        return { link: href, title };
+        return { link: href, title, publishedAt: feedDate(e.published ?? e.updated) };
       })
       .filter((x): x is FeedItem => x !== null);
   }
@@ -89,7 +103,7 @@ export async function syncRssSource(source: SourceRow): Promise<{ ingested: numb
   let duplicates = 0;
   for (const item of items) {
     try {
-      const result = await ingestUrl(item.link);
+      const result = await ingestUrl(item.link, { sourceDate: item.publishedAt });
       if (result.status === "created") ingested++;
       else duplicates++;
     } catch (err) {

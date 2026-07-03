@@ -5,6 +5,8 @@ export interface YouTubeResult {
   channel: string;
   transcript: string;
   videoId: string;
+  /** ISO date (YYYY-MM-DD) the video was uploaded, when yt-dlp reports it. */
+  uploadDate: string | null;
 }
 
 const VIDEO_ID_RE = /(?:v=|\/shorts\/|youtu\.be\/)([a-zA-Z0-9_-]{11})/;
@@ -81,7 +83,7 @@ export async function fetchYouTubeTranscript(url: string): Promise<YouTubeResult
       transcript,
     ].join("\n");
 
-    return { title, channel, transcript: content, videoId };
+    return { title, channel, transcript: content, videoId, uploadDate: date || null };
   } finally {
     await $`rm -rf ${tmpDir}`.quiet();
   }

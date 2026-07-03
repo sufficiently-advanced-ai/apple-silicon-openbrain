@@ -11,7 +11,13 @@ export interface IngestResult {
   title: string;
 }
 
-export async function ingestUrl(targetUrl: string): Promise<IngestResult> {
+export async function ingestUrl(
+  targetUrl: string,
+  opts: {
+    /** ISO date the content was originally published (e.g. RSS pubDate). */
+    sourceDate?: string;
+  } = {},
+): Promise<IngestResult> {
   // A URL maps deterministically to one source, so dedup on (source, source_id)
   // to match the partial unique index and avoid re-scraping known URLs.
   const source = isYouTubeUrl(targetUrl) ? "youtube" : "web";
@@ -40,6 +46,7 @@ export async function ingestUrl(targetUrl: string): Promise<IngestResult> {
         source: "youtube",
         sourceId: targetUrl,
         memoryType: "fact",
+        sourceDate: yt.uploadDate ?? opts.sourceDate,
       },
       { createdBy: "import" },
     );
@@ -53,6 +60,7 @@ export async function ingestUrl(targetUrl: string): Promise<IngestResult> {
       source: "web",
       sourceId: targetUrl,
       memoryType: "fact",
+      sourceDate: opts.sourceDate,
     },
     { createdBy: "import" },
   );
