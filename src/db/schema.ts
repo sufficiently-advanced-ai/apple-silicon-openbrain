@@ -47,8 +47,14 @@ export const memories = pgTable(
     workspaceId: text("workspace_id"),
     projectId: text("project_id"),
     visibility: text("visibility"),
+    // Written by the external LCARS/Hermes pipeline (see 0010_external_drift.sql),
+    // which also installs the notify_openbrain_memory pg_notify triggers.
+    originSourceId: uuid("origin_source_id"),
   },
   (table) => [
+    index("idx_memories_embedding")
+      .using("hnsw", table.embedding.op("vector_cosine_ops"))
+      .with({ m: 16, ef_construction: 64 }),
     index("idx_memories_tags").using("gin", table.tags),
     index("idx_memories_entities").using("gin", table.entities),
     index("idx_memories_content_fts").using(
@@ -72,6 +78,15 @@ export const memories = pgTable(
     index("idx_memories_supersedes")
       .on(table.supersedes)
       .where(sql`${table.supersedes} IS NOT NULL`),
+    index("idx_memories_deleted")
+      .on(table.deletedAt)
+      .where(sql`${table.deletedAt} IS NOT NULL`),
+    index("idx_memories_expires")
+      .on(table.expiresAt)
+      .where(sql`${table.expiresAt} IS NOT NULL AND ${table.deletedAt} IS NULL`),
+    index("idx_memories_origin_source")
+      .on(table.originSourceId)
+      .where(sql`${table.originSourceId} IS NOT NULL AND ${table.deletedAt} IS NULL`),
     // Trust rule: instruction-grade memory must be human-confirmed or trusted-imported.
     // NULL-safe: `provenance_status IN (...)` is NULL when provenance_status is NULL,
     // and Postgres treats a NULL CHECK predicate as satisfied — COALESCE(...,false)
@@ -110,10 +125,27 @@ export const memoryLinks = pgTable(
     targetMemoryId: uuid("target_memory_id").notNull().references(() => memories.id),
     similarity: real("similarity").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    // Set when the user marks the pair "keep both" in the duplicates view.
+    // The link still counts as related; it just stops surfacing as a duplicate.
+    dismissedAt: timestamp("dismissed_at", { withTimezone: true }),
+    // Link kind. 'similar' is the default embedding-similarity link (undirected).
+    // 'derived_from' is directional lineage — sourceMemoryId is the derivative
+    // (e.g. an Obsidian analysis note), targetMemoryId is the source it was
+    // produced from (e.g. the YouTube transcript). Detected from deterministic
+    // back-references (a URL / video id the derivative carries), not similarity.
+    relationship: text("relationship").notNull().default("similar"),
   },
   (table) => [
     index("idx_memory_links_source").on(table.sourceMemoryId),
     index("idx_memory_links_target").on(table.targetMemoryId),
+    index("idx_memory_links_relationship").on(table.relationship),
+    // One link per undirected pair per relationship — what makes linking.ts's
+    // ON CONFLICT DO NOTHING actually catch duplicate inserts.
+    uniqueIndex("idx_memory_links_pair_unique").on(
+      sql`least(${table.sourceMemoryId}, ${table.targetMemoryId})`,
+      sql`greatest(${table.sourceMemoryId}, ${table.targetMemoryId})`,
+      table.relationship
+    ),
   ]
 );
 

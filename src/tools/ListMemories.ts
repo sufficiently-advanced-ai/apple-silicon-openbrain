@@ -42,6 +42,8 @@ export async function listMemories(input: z.infer<typeof ListMemoriesSchema>) {
     );
   }
 
+  // Fetch one past the page so callers can tell whether another page exists
+  // without a second probing call.
   const rows = await db
     .select({
       id: memories.id,
@@ -55,8 +57,10 @@ export async function listMemories(input: z.infer<typeof ListMemoriesSchema>) {
     .from(memories)
     .where(and(...conditions))
     .orderBy(desc(memories.createdAt))
-    .limit(input.limit)
+    .limit(input.limit + 1)
     .offset(input.offset);
 
-  return { memories: rows, count: rows.length };
+  const hasMore = rows.length > input.limit;
+  const page = hasMore ? rows.slice(0, input.limit) : rows;
+  return { memories: page, count: page.length, hasMore };
 }

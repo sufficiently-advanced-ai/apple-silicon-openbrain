@@ -60,7 +60,15 @@ function patchFor(action: ReviewMemoryInput["action"]): Patch {
   }
 }
 
-export async function reviewMemory(input: ReviewMemoryInput) {
+export interface ReviewMemoryOptions {
+  // Who is reviewing. Server-side context (MCP passes "agent", the UI passes
+  // "user") — recorded in the audit log so an agent-driven confirm is
+  // distinguishable from a human one.
+  actor?: "user" | "agent" | "system";
+}
+
+export async function reviewMemory(input: ReviewMemoryInput, opts: ReviewMemoryOptions = {}) {
+  const actor = opts.actor ?? "user";
   const [existing] = await db
     .select({ id: memories.id, reviewStatus: memories.reviewStatus })
     .from(memories)
@@ -96,7 +104,7 @@ export async function reviewMemory(input: ReviewMemoryInput) {
     recordAudit({
       memoryId: input.relatedId,
       action: "supersede",
-      actor: "user",
+      actor,
       diff: { supersededBy: input.id, notes: input.notes ?? null },
     }).catch(() => {});
   }
@@ -117,7 +125,7 @@ export async function reviewMemory(input: ReviewMemoryInput) {
   recordAudit({
     memoryId: input.id,
     action: "review",
-    actor: "user",
+    actor,
     diff: { action: input.action, from: existing.reviewStatus, notes: input.notes ?? null },
   }).catch(() => {});
 

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { eq, isNull, and } from "drizzle-orm";
-import { db } from "../db/client.js";
+import { db, pg } from "../db/client.js";
 import { memories } from "../db/schema.js";
 
 export const RecallMemorySchema = z.object({
@@ -36,5 +36,39 @@ export async function recallMemory(input: z.infer<typeof RecallMemorySchema>) {
     .where(and(eq(memories.id, input.id), isNull(memories.deletedAt)));
 
   if (!row) return { error: "Memory not found" };
-  return row;
+
+  // Lineage (derived_from links) for the Detail view. `derivedFrom` are the
+  // source(s) this memory was produced from; `derivatives` are notes produced
+  // from this memory. Best-effort — never fail the recall over the links table.
+  let derivedFrom: LineageRef[] = [];
+  let derivatives: LineageRef[] = [];
+  try {
+    derivedFrom = (await pg`
+      SELECT l.target_memory_id AS id, l.similarity, m.summary, m.source,
+             m.source_id AS "sourceId", left(m.content, 240) AS snippet
+      FROM memory_links l
+      JOIN memories m ON m.id = l.target_memory_id AND m.deleted_at IS NULL
+      WHERE l.relationship = 'derived_from' AND l.source_memory_id = ${input.id}
+      ORDER BY l.similarity DESC`) as unknown as LineageRef[];
+    derivatives = (await pg`
+      SELECT l.source_memory_id AS id, l.similarity, m.summary, m.source,
+             m.source_id AS "sourceId", left(m.content, 240) AS snippet
+      FROM memory_links l
+      JOIN memories m ON m.id = l.source_memory_id AND m.deleted_at IS NULL
+      WHERE l.relationship = 'derived_from' AND l.target_memory_id = ${input.id}
+      ORDER BY l.similarity DESC`) as unknown as LineageRef[];
+  } catch {
+    // Links table may not exist yet — graceful degradation.
+  }
+
+  return { ...row, derivedFrom, derivatives };
+}
+
+interface LineageRef {
+  id: string;
+  similarity: number;
+  summary: string | null;
+  source: string | null;
+  sourceId: string | null;
+  snippet: string;
 }

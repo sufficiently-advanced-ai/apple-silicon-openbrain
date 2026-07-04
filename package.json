@@ -13,6 +13,7 @@
     "db:migrate": "bun run src/db/migrate.ts",
     "health": "bun run scripts/health-check.ts",
     "test": "bun test",
+    "test:live": "OPENBRAIN_LIVE_TESTS=1 bun test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -19,8 +19,38 @@ export const UpdateMemorySchema = z.object({
   entities: z.record(z.array(z.string())).optional().describe("Replace entities"),
 });
 
-export async function updateMemory(input: z.infer<typeof UpdateMemorySchema>) {
+export interface UpdateMemoryOptions {
+  // Who is making this update. Server-side context (MCP passes "agent", the UI
+  // passes "user") — never part of the public input schema.
+  actor?: "user" | "agent" | "system";
+}
+
+export async function updateMemory(
+  input: z.infer<typeof UpdateMemorySchema>,
+  opts: UpdateMemoryOptions = {},
+) {
+  const actor = opts.actor ?? "user";
   const updates: Record<string, unknown> = { updatedAt: new Date() };
+
+  const [existing] = await db
+    .select({
+      id: memories.id,
+      reviewStatus: memories.reviewStatus,
+      canUseAsInstruction: memories.canUseAsInstruction,
+    })
+    .from(memories)
+    .where(and(eq(memories.id, input.id), isNull(memories.deletedAt)))
+    .limit(1);
+  if (!existing) return { error: "Memory not found" };
+
+  // Trust-ladder guard: a non-user content rewrite of confirmed/instruction-
+  // grade memory demotes it back to pending review. Without this, an agent
+  // could replace the content of a user-confirmed rule wholesale while the row
+  // kept can_use_as_instruction=true.
+  const demoted =
+    input.content !== undefined &&
+    actor !== "user" &&
+    (existing.canUseAsInstruction || existing.reviewStatus === "confirmed");
 
   if (input.content !== undefined) {
     const embedding = await getEmbedding(input.content);
@@ -29,6 +59,12 @@ export async function updateMemory(input: z.infer<typeof UpdateMemorySchema>) {
     updates.embedding = embedding;
     // Keep the advisory dedup key in sync with the new content.
     updates.contentFingerprint = contentFingerprint(input.content);
+  }
+  if (demoted) {
+    updates.reviewStatus = "pending";
+    updates.canUseAsInstruction = false;
+    updates.provenanceStatus = "generated";
+    updates.requiresUserConfirmation = true;
   }
   if (input.memoryType !== undefined) updates.memoryType = input.memoryType;
   if (input.tags !== undefined) updates.tags = input.tags;
@@ -45,9 +81,10 @@ export async function updateMemory(input: z.infer<typeof UpdateMemorySchema>) {
   recordAudit({
     memoryId: row.id,
     action: "update",
-    actor: "user",
+    actor,
     diff: {
       contentChanged: input.content !== undefined,
+      demoted,
       memoryType: input.memoryType,
       tags: input.tags,
       entities: input.entities,
@@ -59,5 +96,7 @@ export async function updateMemory(input: z.infer<typeof UpdateMemorySchema>) {
     queueEnrichment(row.id, input.content);
   }
 
-  return row;
+  // Surface the demotion so an agent caller knows the memory now needs
+  // ReviewMemory 'confirm' again.
+  return demoted ? { ...row, demoted: true as const } : row;
 }

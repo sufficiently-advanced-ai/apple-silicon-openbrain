@@ -1,6 +1,7 @@
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { createServer } from "./server.js";
 import { config } from "./lib/config.js";
+import { isAuthorizedRequest } from "./lib/auth.js";
 import { ingestUrl } from "./services/ingest.js";
 import { enrichmentQueueDepth } from "./services/enrichment.js";
 import { handleSourcesRoute } from "./api/sources.js";
@@ -8,8 +9,30 @@ import { handleSourcesRoute } from "./api/sources.js";
 // Session management: map session IDs to their transport+server
 const sessions = new Map<
   string,
-  { transport: WebStandardStreamableHTTPServerTransport; server: ReturnType<typeof createServer> }
+  {
+    transport: WebStandardStreamableHTTPServerTransport;
+    server: ReturnType<typeof createServer>;
+    lastSeen: number;
+  }
 >();
+
+// HTTP MCP clients that vanish without closing their session leak a Map entry
+// (and a server object) forever — the live box had accumulated 80+. Sweep
+// sessions idle past the TTL; a swept client just re-initializes on next use.
+const SESSION_IDLE_MS = 2 * 60 * 60 * 1000;
+const SESSION_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
+setInterval(() => {
+  const cutoff = Date.now() - SESSION_IDLE_MS;
+  let swept = 0;
+  for (const [id, session] of sessions) {
+    if (session.lastSeen < cutoff) {
+      sessions.delete(id);
+      swept++;
+      Promise.resolve(session.transport.close()).catch(() => {});
+    }
+  }
+  if (swept > 0) console.log(`[sessions] swept ${swept} idle session(s), ${sessions.size} live`);
+}, SESSION_SWEEP_INTERVAL_MS).unref();
 
 const app = Bun.serve({
   port: config.mcpPort,
@@ -32,22 +55,12 @@ const app = Bun.serve({
       });
     }
 
-    // Bearer token auth for non-localhost requests (skip /api/* for now)
-    if (config.authToken && !url.pathname.startsWith("/api/")) {
-      const remoteIp =
-        req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
-        this.requestIP(req)?.address;
-      const isLocal =
-        remoteIp === "127.0.0.1" ||
-        remoteIp === "::1" ||
-        remoteIp === "::ffff:127.0.0.1";
-
-      if (!isLocal) {
-        const auth = req.headers.get("authorization");
-        if (auth !== `Bearer ${config.authToken}`) {
-          return new Response("Unauthorized", { status: 401 });
-        }
-      }
+    // Trusted networks (loopback / tailnet / LAN) pass; anything else needs the
+    // bearer token. Applies to /mcp AND /api/* — the old gate skipped /api/*
+    // entirely and trusted a spoofable X-Forwarded-For (see lib/auth.ts).
+    // /health stays open for probes.
+    if (url.pathname !== "/health" && !isAuthorizedRequest(req, this.requestIP(req)?.address)) {
+      return new Response("Unauthorized", { status: 401 });
     }
 
     if (url.pathname === "/mcp") {
@@ -55,8 +68,9 @@ const app = Bun.serve({
 
       // Existing session
       if (sessionId && sessions.has(sessionId)) {
-        const { transport } = sessions.get(sessionId)!;
-        return transport.handleRequest(req);
+        const session = sessions.get(sessionId)!;
+        session.lastSeen = Date.now();
+        return session.transport.handleRequest(req);
       }
 
       // New session (initialization request)
@@ -64,7 +78,7 @@ const app = Bun.serve({
         const transport = new WebStandardStreamableHTTPServerTransport({
           sessionIdGenerator: () => crypto.randomUUID(),
           onsessioninitialized: (id) => {
-            sessions.set(id, { transport, server });
+            sessions.set(id, { transport, server, lastSeen: Date.now() });
           },
           onsessionclosed: (id) => {
             sessions.delete(id);
@@ -157,3 +171,27 @@ const app = Bun.serve({
 });
 
 console.log(`OpenBrain MCP server listening on ${config.mcpHost}:${config.mcpPort}`);
+
+// Boot-time sanity check: LLM_MODEL must match what mlx-lm actually has loaded,
+// or every enrichment call hot-swaps the model and thrashes the GPU. Non-fatal —
+// the server is useful without enrichment — but loud.
+(async () => {
+  try {
+    const res = await fetch(`${config.llmUrl}/v1/models`, {
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!res.ok) return;
+    const data = (await res.json()) as { data?: { id?: string }[] };
+    const loaded = (data.data ?? []).map((m) => m.id).filter(Boolean) as string[];
+    if (loaded.length > 0 && !loaded.includes(config.llmModel)) {
+      console.warn(
+        `[llm] LLM_MODEL mismatch: config wants "${config.llmModel}" but mlx-lm has ` +
+          `[${loaded.join(", ")}] loaded. Enrichment will hot-swap models and thrash the GPU — ` +
+          `fix LLM_MODEL or the com.openbrain.llm plist.`,
+      );
+    }
+  } catch {
+    // mlx-lm not up yet (KeepAlive services race at boot) — enrichment has its
+    // own retries; nothing to do here.
+  }
+})();

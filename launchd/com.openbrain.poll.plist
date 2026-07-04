@@ -18,10 +18,33 @@
         <string>-H</string>
         <string>Content-Type: application/json</string>
     </array>
-    <key>StartInterval</key>
-    <integer>3600</integer>
-    <key>RunAtLoad</key>
-    <true/>
+    <!-- Fire 3x/day: morning, midday, early evening. launchd is the SOLE
+         heartbeat for /api/sources/poll-due (the tray app no longer runs its
+         own timer), so these three times are the only moments sources sync -
+         and thus the only moments Firecrawl is hit. Missed fires (Mac asleep)
+         run once on wake. RunAtLoad intentionally omitted to avoid an extra
+         off-window scrape at login. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>7</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>12</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
     <key>StandardOutPath</key>
     <string>__REPO__/logs/poll.log</string>
     <key>StandardErrorPath</key>

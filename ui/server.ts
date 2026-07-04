@@ -1,6 +1,10 @@
+import { z } from "zod";
 import { desc, isNull, and, sql, eq, ilike } from "drizzle-orm";
+import { isAuthorizedRequest } from "../src/lib/auth.js";
 import { db, pg } from "../src/db/client.js";
 import { memories } from "../src/db/schema.js";
+import { recordAudit } from "../src/services/audit.js";
+import { deleteMemory, restoreMemory } from "../src/tools/DeleteMemory.js";
 import { storeMemory, StoreMemorySchema } from "../src/tools/StoreMemory.js";
 import { updateMemory, UpdateMemorySchema } from "../src/tools/UpdateMemory.js";
 import { recallMemory } from "../src/tools/RecallMemory.js";
@@ -66,6 +70,13 @@ Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
     const { pathname } = url;
+
+    // Same trust gate as the MCP server: loopback/tailnet/LAN pass, anything
+    // else needs the bearer token. This server exposes destructive writes
+    // (edit, review, bulk delete) and previously had no auth at all.
+    if (!isAuthorizedRequest(req, this.requestIP(req)?.address)) {
+      return new Response("Unauthorized", { status: 401 });
+    }
 
     if (req.method === "GET" && pathname === "/") {
       return new Response(indexHtml, { headers: { "content-type": "text/html" } });
@@ -159,7 +170,9 @@ Bun.serve({
       try {
         const body = await req.json();
         const parsed = StoreMemorySchema.parse({ ...body, source: body.source || "manual" });
-        const result = await storeMemory(parsed);
+        // A dashboard add is a human write — without this it lands in the
+        // review queue as agent-generated evidence.
+        const result = await storeMemory(parsed, { createdBy: "user" });
         return json(result, 201);
       } catch (err) {
         return json({ error: (err as Error).message }, 400);
@@ -215,17 +228,23 @@ Bun.serve({
       const groupLimit = 50;
 
       // Exact duplicates: rows sharing a content_fingerprint (advisory dedup key).
+      // Already-resolved memory (superseded/disputed/rejected) is excluded so
+      // resolving a group actually clears it from this view (same default
+      // exclusion as ListMemories).
       const dupRows = (await pg`
-        WITH dup AS (
-          SELECT content_fingerprint
-          FROM memories
+        WITH live AS (
+          SELECT * FROM memories
           WHERE deleted_at IS NULL AND content_fingerprint IS NOT NULL
+            AND coalesce(provenance_status, '') NOT IN ('superseded', 'disputed')
+            AND coalesce(review_status, '') <> 'rejected'
+        ),
+        dup AS (
+          SELECT content_fingerprint FROM live
           GROUP BY content_fingerprint HAVING count(*) > 1
         )
         SELECT m.content_fingerprint AS fp, m.id, m.content, m.created_at AS "createdAt",
                m.source, m.review_status AS "reviewStatus", m.provenance_status AS "provenanceStatus"
-        FROM memories m JOIN dup ON dup.content_fingerprint = m.content_fingerprint
-        WHERE m.deleted_at IS NULL
+        FROM live m JOIN dup ON dup.content_fingerprint = m.content_fingerprint
         ORDER BY m.content_fingerprint, m.created_at
       `) as any[];
       const groupMap = new Map<string, any[]>();
@@ -245,8 +264,13 @@ Bun.serve({
                l.target_memory_id AS "bId", sb.content AS "bContent", sb.created_at AS "bCreatedAt"
         FROM memory_links l
         JOIN memories sa ON sa.id = l.source_memory_id AND sa.deleted_at IS NULL
+          AND coalesce(sa.provenance_status, '') NOT IN ('superseded', 'disputed')
+          AND coalesce(sa.review_status, '') <> 'rejected'
         JOIN memories sb ON sb.id = l.target_memory_id AND sb.deleted_at IS NULL
-        WHERE l.similarity >= ${threshold}
+          AND coalesce(sb.provenance_status, '') NOT IN ('superseded', 'disputed')
+          AND coalesce(sb.review_status, '') <> 'rejected'
+        WHERE l.similarity >= ${threshold} AND l.dismissed_at IS NULL
+          AND l.relationship <> 'derived_from'
         ORDER BY l.similarity DESC
         LIMIT 50
       `) as any[];
@@ -254,20 +278,110 @@ Bun.serve({
       return json({ exact, near, threshold });
     }
 
-    // POST /api/duplicates/resolve  body: { keepId, supersedeId, notes? }
-    // Supersede the older/duplicate memory via the trust-ladder supersede flow.
+    // POST /api/duplicates/resolve
+    // body: { keepId, supersedeId, notes? }  — single pair, or
+    //       { pairs: [{ keepId, supersedeId }], notes? }  — bulk keep/supersede
     if (req.method === "POST" && pathname === "/api/duplicates/resolve") {
       try {
-        const body = (await req.json()) as { keepId?: string; supersedeId?: string; notes?: string };
-        const parsed = ReviewMemorySchema.parse({
-          id: body.keepId,
-          action: "supersede",
-          relatedId: body.supersedeId,
-          notes: body.notes,
-        });
-        const result = await reviewMemory(parsed);
-        if ("error" in result) return json(result, 400);
-        return json(result);
+        const body = (await req.json()) as {
+          keepId?: string; supersedeId?: string; notes?: string;
+          pairs?: { keepId?: string; supersedeId?: string }[];
+        };
+        const pairs = body.pairs ?? [{ keepId: body.keepId, supersedeId: body.supersedeId }];
+        if (pairs.length > 100) return json({ error: "too many pairs (max 100)" }, 400);
+        const resolved: string[] = [];
+        for (const p of pairs) {
+          try {
+            const parsed = ReviewMemorySchema.parse({
+              id: p.keepId,
+              action: "supersede",
+              relatedId: p.supersedeId,
+              notes: body.notes,
+            });
+            const result = await reviewMemory(parsed, { actor: "user" });
+            if ("error" in result) {
+              if (pairs.length === 1) return json(result, 400);
+              continue;
+            }
+            resolved.push(p.supersedeId!);
+          } catch (e) {
+            if (pairs.length === 1) return json({ error: (e as Error).message }, 400);
+            continue;
+          }
+        }
+        return json({ resolved, count: resolved.length });
+      } catch (err) {
+        return json({ error: (err as Error).message }, 400);
+      }
+    }
+
+    // POST /api/duplicates/delete  body: { ids: string[], reason?: string }
+    // Soft-delete every listed memory — for junk pairs/groups where neither
+    // side is worth keeping (email footers, bad scrapes). Audited per row.
+    if (req.method === "POST" && pathname === "/api/duplicates/delete") {
+      try {
+        const body = (await req.json()) as { ids?: unknown; reason?: string };
+        const ids = z.array(z.string().uuid()).min(1).max(100).parse(body.ids);
+        const deleted: string[] = [];
+        for (const id of ids) {
+          const r = await deleteMemory({ id }, { actor: "web", reason: body.reason ?? "duplicate cleanup" });
+          if (!("error" in r)) deleted.push(id);
+        }
+        return json({ deleted, count: deleted.length });
+      } catch (err) {
+        return json({ error: (err as Error).message }, 400);
+      }
+    }
+
+    // POST /api/duplicates/dismiss  body: { pairs: [{ aId, bId }] }
+    // "Keep both": stamp the link so the pair stops surfacing as a duplicate.
+    // The link survives and still feeds the related-memories list.
+    if (req.method === "POST" && pathname === "/api/duplicates/dismiss") {
+      try {
+        const body = (await req.json()) as { pairs?: unknown };
+        const pairs = z
+          .array(z.object({ aId: z.string().uuid(), bId: z.string().uuid() }))
+          .min(1).max(100)
+          .parse(body.pairs);
+        let count = 0;
+        for (const p of pairs) {
+          const updated = await pg`
+            UPDATE memory_links SET dismissed_at = now()
+            WHERE dismissed_at IS NULL
+              AND ((source_memory_id = ${p.aId} AND target_memory_id = ${p.bId})
+                OR (source_memory_id = ${p.bId} AND target_memory_id = ${p.aId}))
+            RETURNING id
+          `;
+          if (updated.length) {
+            count++;
+            for (const id of [p.aId, p.bId]) {
+              recordAudit({
+                memoryId: id,
+                action: "review",
+                actor: "web",
+                diff: { keepBoth: true, pairedWith: id === p.aId ? p.bId : p.aId },
+              }).catch(() => {});
+            }
+          }
+        }
+        return json({ dismissed: count });
+      } catch (err) {
+        return json({ error: (err as Error).message }, 400);
+      }
+    }
+
+    // POST /api/duplicates/restore  body: { ids: string[] }
+    // Undo for the duplicates view's delete: clears deleted_at on each row.
+    if (req.method === "POST" && pathname === "/api/duplicates/restore") {
+      try {
+        const body = (await req.json()) as { ids?: unknown };
+        const ids = z.array(z.string().uuid()).min(1).max(100).parse(body.ids);
+        const restored: string[] = [];
+        for (const id of ids) {
+          const r = await restoreMemory({ id }, { actor: "web", reason: "undo duplicate delete" });
+          if (!("error" in r)) restored.push(id);
+        }
+        return json({ restored, count: restored.length });
       } catch (err) {
         return json({ error: (err as Error).message }, 400);
       }
@@ -279,7 +393,7 @@ Bun.serve({
       try {
         const body = await req.json();
         const parsed = ReviewMemorySchema.parse({ ...body, id: reviewMatch[1] });
-        const result = await reviewMemory(parsed);
+        const result = await reviewMemory(parsed, { actor: "user" });
         if ("error" in result) return json(result, 400);
         return json(result);
       } catch (err) {
@@ -293,11 +407,14 @@ Bun.serve({
       const id = detailMatch[1];
       const m = await recallMemory({ id });
       if ("error" in m) return json(m, 404);
-      // Linked (related) memories from the similarity-link table.
+      // Linked (related) memories from the similarity-link table. Lineage
+      // (derived_from) is surfaced separately via recallMemory's
+      // derivedFrom/derivatives, so it's excluded from plain Connections here.
       const links = (await pg`
         SELECT source_memory_id AS s, target_memory_id AS t, similarity
         FROM memory_links
-        WHERE source_memory_id = ${id} OR target_memory_id = ${id}
+        WHERE (source_memory_id = ${id} OR target_memory_id = ${id})
+          AND relationship <> 'derived_from'
         ORDER BY similarity DESC
         LIMIT 20
       `) as any[];
@@ -320,7 +437,7 @@ Bun.serve({
       try {
         const body = await req.json();
         const parsed = UpdateMemorySchema.parse({ ...body, id: detailMatch[1] });
-        const result = await updateMemory(parsed);
+        const result = await updateMemory(parsed, { actor: "user" });
         if ("error" in result) return json(result, 404);
         return json(result);
       } catch (err) {
@@ -347,7 +464,7 @@ Bun.serve({
         }
         for (const t of body.remove ?? []) set.delete(t);
 
-        const result = await updateMemory({ id, tags: Array.from(set) });
+        const result = await updateMemory({ id, tags: Array.from(set) }, { actor: "user" });
         return json(result);
       } catch (err) {
         return json({ error: (err as Error).message }, 400);

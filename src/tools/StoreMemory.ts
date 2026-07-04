@@ -6,6 +6,7 @@ import { getEmbedding } from "../services/embedding.js";
 import { getCachedEmbedding, setCachedEmbedding } from "../services/cache.js";
 import { queueEnrichment } from "../services/enrichment.js";
 import { linkRelatedMemories } from "../services/linking.js";
+import { detectLineage } from "../services/lineage.js";
 import { contentFingerprint } from "../services/fingerprint.js";
 import { recordAudit } from "../services/audit.js";
 
@@ -25,6 +26,13 @@ export const StoreMemorySchema = z.object({
     .record(z.array(z.string()))
     .optional()
     .describe("Named entities: { person: [...], tech: [...], ... }"),
+  sourceDate: z
+    .string()
+    .refine((v) => !Number.isNaN(Date.parse(v)), "must be an ISO 8601 date")
+    .optional()
+    .describe(
+      "ISO date the content was originally created/published (article date, video upload, email date) — distinct from when it is stored",
+    ),
 });
 
 export type StoreMemoryInput = z.infer<typeof StoreMemorySchema>;
@@ -90,6 +98,7 @@ export async function storeMemory(input: StoreMemoryInput, opts: StoreMemoryOpti
       memoryType: input.memoryType ?? null,
       tags: input.tags ?? [],
       entities: input.entities ?? {},
+      sourceDate: input.sourceDate ? new Date(input.sourceDate) : null,
       contentFingerprint: fingerprint,
       createdBy,
       provenanceStatus,
@@ -144,8 +153,19 @@ export async function storeMemory(input: StoreMemoryInput, opts: StoreMemoryOpti
     queueEnrichment(row.id, input.content);
   }
 
-  // Fire-and-forget cross-memory linking
-  linkRelatedMemories(row.id).catch(() => {});
+  // Fire-and-forget cross-memory linking, then lineage detection. Lineage runs
+  // after linking so it can promote a just-created `similar` link into a
+  // directional `derived_from` when this memory is a source/derivative pair.
+  linkRelatedMemories(row.id)
+    .then(() =>
+      detectLineage({
+        memoryId: row.id,
+        content: input.content,
+        source: input.source,
+        sourceId: input.sourceId,
+      }),
+    )
+    .catch(() => {});
 
   return { id: row.id, createdAt: row.createdAt };
 }

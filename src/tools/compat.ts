@@ -70,12 +70,17 @@ export function registerCompatTools(server: McpServer): void {
     }
   );
 
+  const UUID_RE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+
   server.tool(
     "fetch",
-    "Fetch one OpenBrain memory by ID after using `search` (OB1/ChatGPT-compatible). Read-only; returns full text and metadata for citation.",
-    { id: z.string().describe("The OpenBrain memory ID returned by `search`") },
+    "Fetch one OpenBrain memory by ID after using `search` (OB1/ChatGPT-compatible). Read-only; returns full text and metadata for citation. Native callers get richer output (governance, lineage) from RecallMemory.",
+    { id: z.string().describe("The OpenBrain memory ID (UUID) returned by `search`") },
     async ({ id }) => {
       try {
+        if (!UUID_RE.test(id)) {
+          return text(`Fetch error: '${id}' is not a memory ID — use the UUID returned by \`search\`.`, true);
+        }
         const m = await recallMemory({ id });
         if ("error" in m) return text(`Fetch error: ${m.error}`, true);
         const document = {
@@ -103,11 +108,17 @@ export function registerCompatTools(server: McpServer): void {
   // --- search_thoughts ---
   server.tool(
     "search_thoughts",
-    "Search captured memories by meaning (OB1-compatible). Use when the user asks about a topic, person, or idea they've captured before.",
+    "OB1-compatible alias returning text-formatted search results with a 0.5 similarity floor. Native callers should prefer SearchMemory (structured output, filters, no hidden threshold).",
     {
       query: z.string().describe("What to search for"),
-      limit: z.number().optional().default(10),
-      threshold: z.number().optional().default(0.5),
+      limit: z.number().int().min(1).max(50).optional().default(10).describe("Max results (1-50)"),
+      threshold: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .default(0.5)
+        .describe("Minimum cosine similarity (0..1); results below are dropped. Default 0.5"),
     },
     async ({ query, limit, threshold }) => {
       try {
@@ -142,9 +153,9 @@ export function registerCompatTools(server: McpServer): void {
   // --- list_thoughts ---
   server.tool(
     "list_thoughts",
-    "List recently captured memories with optional filters by type, topic, person, or time range (OB1-compatible).",
+    "OB1-compatible alias listing recent memories as text, with optional filters by type, topic, person, or time range. Native callers should prefer ListMemories (structured output, pagination).",
     {
-      limit: z.number().optional().default(10),
+      limit: z.number().int().min(1).max(200).optional().default(10).describe("Max results (1-200)"),
       type: z.string().optional().describe("Filter by memoryType"),
       topic: z.string().optional().describe("Filter by tag"),
       person: z.string().optional().describe("Filter by person entity"),

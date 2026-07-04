@@ -181,7 +181,7 @@
         margin-bottom: 8px;
         align-items: center;
       }
-      .card .content {
+      .content {
         white-space: pre-wrap;
         word-break: break-word;
         font-family: ui-monospace, monospace;
@@ -219,8 +219,11 @@
       .dl { display: grid; grid-template-columns: 140px 1fr; gap: 6px 14px; font-size: 13px; }
       .dl dt { color: var(--muted); }
       .dl dd { margin: 0; }
-      .dup-pair { display: grid; grid-template-columns: 1fr auto 1fr; gap: 14px; align-items: stretch; }
+      .dup-pair { display: grid; grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr); gap: 14px; align-items: stretch; }
       .dup-pair .content { max-height: 180px; }
+      .dup-pair > div { min-width: 0; }
+      .dup-sel { display: flex; align-items: flex-start; padding-top: 2px; }
+      .dup-check, #dup-selall { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
       .dup-mid { display: flex; flex-direction: column; gap: 8px; align-items: center; justify-content: center; }
       .muted { color: var(--muted); }
       .section-h { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; margin: 22px 0 10px; }
@@ -312,6 +315,12 @@
           case "detail-addtag": openDetailAddTag(d.id, t); break;
           case "review": review(d.id, d.action); break;
           case "resolvedup": resolveDup(d.keep, d.supersede); break;
+          case "deldup": deleteDup(d.ids.split(",")); break;
+          case "undodel": undoDelete(); break;
+          case "bulkdel": bulkDeleteSelected(); break;
+          case "bulkkeep": bulkKeepSelected(); break;
+          case "keepboth": keepBoth([{ aId: d.a, bId: d.b }]); break;
+          case "bulkkeepboth": bulkKeepBothSelected(); break;
         }
       }
       document.addEventListener("click", (e) => {
@@ -652,6 +661,20 @@
              <div class="content" style="max-height:80px">${escape(l.content)}</div>
            </a>`
         ).join("");
+        const lineageCard = (l) =>
+          `<a class="card click" style="display:block" href="#/memory/${escape(l.id)}">
+             <div class="meta"><span class="badge sim">${pct(l.similarity)}</span>${l.source ? `<span class="badge">${escape(l.source)}</span>` : ""}</div>
+             <div class="content" style="max-height:80px">${escape(l.summary || l.snippet || "")}</div>
+           </a>`;
+        const derivedFrom = (m.derivedFrom || []).map(lineageCard).join("");
+        const derivatives = (m.derivatives || []).map(lineageCard).join("");
+        const lineagePanel = (m.derivedFrom && m.derivedFrom.length) || (m.derivatives && m.derivatives.length)
+          ? `<div class="panel" style="margin-bottom:16px">
+               <h2>Lineage</h2>
+               ${m.derivedFrom && m.derivedFrom.length ? `<label>Derived from ${m.derivedFrom.length > 1 ? `(${m.derivedFrom.length} sources)` : "source"}</label><div class="list">${derivedFrom}</div>` : ""}
+               ${m.derivatives && m.derivatives.length ? `<label style="margin-top:12px">Derivatives (${m.derivatives.length})</label><div class="list">${derivatives}</div>` : ""}
+             </div>`
+          : "";
         const typeOptions = ["", "fact", "decision", "learning", "conversation"].map((t) =>
           `<option value="${t}" ${m.memoryType === t ? "selected" : ""}>${t || "(none)"}</option>`
         ).join("");
@@ -690,6 +713,7 @@
                 ${m.supersedes ? `<dt>supersedes</dt><dd><a href="#/memory/${escape(m.supersedes)}">${escape(m.supersedes)}</a></dd>` : ""}
               </dl>
             </div>
+            ${lineagePanel}
             <div class="panel">
               <h2>Connections${m.linkedMemories && m.linkedMemories.length ? ` (${m.linkedMemories.length})` : ""}</h2>
               <div class="list">${links || '<div class="muted">No linked memories.</div>'}</div>
@@ -878,12 +902,25 @@
               <input type="range" id="dup-th" min="0.7" max="0.99" step="0.01" value="0.9" style="width:200px" />
               <span id="dup-thv" class="muted">0.90</span>
             </div>
+            <div class="row" style="margin-bottom:8px">
+              <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="dup-selall" /> Select all</label>
+              <span id="dup-selcount" class="muted"></span>
+              <button class="sm danger" id="dup-bulkdel" data-act="bulkdel" disabled>Delete selected</button>
+              <button class="sm" id="dup-bulkkeep" data-act="bulkkeep" disabled title="Keep the newest memory in each selected pair/group, supersede the rest">Keep newest</button>
+              <button class="sm ghost" id="dup-bulkkeepboth" data-act="bulkkeepboth" disabled title="Not duplicates — keep both sides of each selected pair and stop showing them (near pairs only)">Keep both</button>
+            </div>
             <div class="status" id="dup-status"></div>
             <div id="dup-body"><div class="empty">Loading…</div></div>
           </div>`;
         const th = $("dup-th");
         th.addEventListener("input", () => { $("dup-thv").textContent = Number(th.value).toFixed(2); });
         th.addEventListener("change", () => loadDuplicates(Number(th.value)));
+        $("view").onchange = (e) => {
+          if (e.target.id === "dup-selall") {
+            document.querySelectorAll(".dup-check").forEach((c) => { c.checked = e.target.checked; });
+          }
+          if (e.target.id === "dup-selall" || e.target.classList.contains("dup-check")) updateDupSel();
+        };
         await loadDuplicates(0.9);
       }
       async function loadDuplicates(threshold) {
@@ -900,9 +937,21 @@
             ${exact || '<div class="muted">None.</div>'}
             <div class="section-h">Near duplicates (vector similarity ≥ ${escape(String(threshold))})</div>
             ${near || '<div class="muted">None above threshold.</div>'}`;
+          if ($("dup-selall")) $("dup-selall").checked = false;
+          updateDupSel();
         } catch (err) {
           body.innerHTML = `<div class="empty">Failed to load duplicates: ${escape(err.message)}</div>`;
         }
+      }
+      function dupChecked() { return Array.from(document.querySelectorAll(".dup-check:checked")); }
+      function updateDupSel() {
+        const checked = dupChecked();
+        const n = checked.length;
+        const pairs = checked.filter((c) => c.dataset.pair).length;
+        if ($("dup-selcount")) $("dup-selcount").textContent = n ? `${n} selected` : "";
+        if ($("dup-bulkdel")) $("dup-bulkdel").disabled = !n;
+        if ($("dup-bulkkeep")) $("dup-bulkkeep").disabled = !n;
+        if ($("dup-bulkkeepboth")) $("dup-bulkkeepboth").disabled = !pairs;
       }
       function renderDupGroup(g) {
         // Keep the newest member; offer to supersede the older ones.
@@ -910,7 +959,11 @@
         const keep = sorted[0];
         return `
           <div class="panel" style="margin-bottom:12px">
-            <div class="muted" style="margin-bottom:8px">${g.members.length} memories share content — keeping newest, supersede the rest:</div>
+            <div class="meta" style="margin-bottom:8px">
+              <input type="checkbox" class="dup-check" data-ids="${sorted.map((mem) => escape(mem.id)).join(",")}" data-keep="${escape(keep.id)}" aria-label="select group" />
+              <span class="muted">${g.members.length} memories share content — keeping newest, supersede the rest:</span>
+              <button class="sm danger" data-act="deldup" data-ids="${sorted.map((mem) => escape(mem.id)).join(",")}">Delete all ${g.members.length}</button>
+            </div>
             ${sorted.map((mem, i) => `
               <div class="card" style="margin-bottom:8px;${i === 0 ? "border-color:var(--good)" : ""}">
                 <div class="meta">
@@ -925,8 +978,12 @@
           </div>`;
       }
       function renderNearPair(p) {
+        const newest = new Date(p.aCreatedAt) >= new Date(p.bCreatedAt) ? p.aId : p.bId;
         return `
           <div class="panel dup-pair" style="margin-bottom:12px">
+            <div class="dup-sel">
+              <input type="checkbox" class="dup-check" data-ids="${escape(p.aId)},${escape(p.bId)}" data-keep="${escape(newest)}" data-pair="${escape(p.aId)},${escape(p.bId)}" aria-label="select pair" />
+            </div>
             <div>
               <div class="meta"><span>${escape(fmt(p.aCreatedAt))}</span><a class="back" style="margin:0" href="#/memory/${escape(p.aId)}">open →</a></div>
               <div class="content" style="max-height:160px">${escape(p.aContent)}</div>
@@ -935,12 +992,109 @@
               <span class="badge sim">${pct(p.similarity)}</span>
               <button class="sm" data-act="resolvedup" data-keep="${escape(p.aId)}" data-supersede="${escape(p.bId)}">Keep ◀</button>
               <button class="sm" data-act="resolvedup" data-keep="${escape(p.bId)}" data-supersede="${escape(p.aId)}">Keep ▶</button>
+              <button class="sm ghost" data-act="keepboth" data-a="${escape(p.aId)}" data-b="${escape(p.bId)}" title="Not duplicates — keep both and stop showing this pair">Keep both</button>
+              <button class="sm danger" data-act="deldup" data-ids="${escape(p.aId)},${escape(p.bId)}">Delete both</button>
             </div>
             <div>
               <div class="meta"><span>${escape(fmt(p.bCreatedAt))}</span><a class="back" style="margin:0" href="#/memory/${escape(p.bId)}">open →</a></div>
               <div class="content" style="max-height:160px">${escape(p.bContent)}</div>
             </div>
           </div>`;
+      }
+      let lastDeleted = [];
+      async function dupPost(path, payload) {
+        const r = await fetch(path, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) throw new Error(await errMsg(r));
+        return r.json();
+      }
+      function dupStatus(html) { if ($("dup-status")) $("dup-status").innerHTML = html; }
+      async function reloadDups() { await loadDuplicates(Number($("dup-th")?.value || 0.9)); }
+      async function deleteDup(ids) {
+        dupStatus("Deleting…");
+        const succeeded = [];
+        try {
+          let count = 0;
+          for (let i = 0; i < ids.length; i += 100) {
+            const batch = ids.slice(i, i + 100);
+            const data = await dupPost("/api/duplicates/delete", { ids: batch });
+            count += data.count;
+            succeeded.push(...batch);
+          }
+          lastDeleted = succeeded;
+          dupStatus(`Deleted ${count}. <button class="sm" data-act="undodel">Undo</button>`);
+          await reloadDups();
+        } catch (err) {
+          lastDeleted = succeeded;
+          dupStatus(`Error: ${escape(err.message)}`);
+        }
+      }
+      async function undoDelete() {
+        if (!lastDeleted.length) return;
+        dupStatus("Restoring…");
+        try {
+          let count = 0;
+          for (let i = 0; i < lastDeleted.length; i += 100) {
+            const data = await dupPost("/api/duplicates/restore", { ids: lastDeleted.slice(i, i + 100) });
+            count += data.count;
+          }
+          lastDeleted = [];
+          dupStatus(`Restored ${count}.`);
+          await reloadDups();
+        } catch (err) {
+          dupStatus(`Error: ${escape(err.message)}`);
+        }
+      }
+      function bulkDeleteSelected() {
+        const ids = Array.from(new Set(dupChecked().flatMap((c) => c.dataset.ids.split(","))));
+        if (ids.length) deleteDup(ids);
+      }
+      async function bulkKeepSelected() {
+        const pairs = [];
+        for (const c of dupChecked()) {
+          const keep = c.dataset.keep;
+          for (const id of c.dataset.ids.split(",")) {
+            if (id !== keep) pairs.push({ keepId: keep, supersedeId: id });
+          }
+        }
+        if (!pairs.length) return;
+        dupStatus("Resolving…");
+        try {
+          let count = 0;
+          for (let i = 0; i < pairs.length; i += 100) {
+            const data = await dupPost("/api/duplicates/resolve", { pairs: pairs.slice(i, i + 100) });
+            count += data.count;
+          }
+          dupStatus(`Kept newest, superseded ${count}.`);
+          await reloadDups();
+        } catch (err) {
+          dupStatus(`Error: ${escape(err.message)}`);
+        }
+      }
+      async function keepBoth(pairs) {
+        dupStatus("Dismissing…");
+        try {
+          let count = 0;
+          for (let i = 0; i < pairs.length; i += 100) {
+            const data = await dupPost("/api/duplicates/dismiss", { pairs: pairs.slice(i, i + 100) });
+            count += data.dismissed;
+          }
+          dupStatus(`Kept both — dismissed ${count} pair${count === 1 ? "" : "s"}.`);
+          await reloadDups();
+        } catch (err) {
+          dupStatus(`Error: ${escape(err.message)}`);
+        }
+      }
+      function bulkKeepBothSelected() {
+        const pairs = dupChecked()
+          .filter((c) => c.dataset.pair)
+          .map((c) => {
+            const [aId, bId] = c.dataset.pair.split(",");
+            return { aId, bId };
+          });
+        if (pairs.length) keepBoth(pairs);
       }
       async function resolveDup(keepId, supersedeId) {
         if ($("dup-status")) $("dup-status").textContent = "Resolving…";
