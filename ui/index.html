@@ -1014,16 +1014,20 @@
       async function reloadDups() { await loadDuplicates(Number($("dup-th")?.value || 0.9)); }
       async function deleteDup(ids) {
         dupStatus("Deleting…");
+        const succeeded = [];
         try {
           let count = 0;
           for (let i = 0; i < ids.length; i += 100) {
-            const data = await dupPost("/api/duplicates/delete", { ids: ids.slice(i, i + 100) });
+            const batch = ids.slice(i, i + 100);
+            const data = await dupPost("/api/duplicates/delete", { ids: batch });
             count += data.count;
+            succeeded.push(...batch);
           }
-          lastDeleted = ids;
+          lastDeleted = succeeded;
           dupStatus(`Deleted ${count}. <button class="sm" data-act="undodel">Undo</button>`);
           await reloadDups();
         } catch (err) {
+          lastDeleted = succeeded;
           dupStatus(`Error: ${escape(err.message)}`);
         }
       }

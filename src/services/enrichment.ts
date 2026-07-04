@@ -139,7 +139,14 @@ export async function enrichMemory(memoryId: string, content: string): Promise<v
     return;
   }
 
-  const parsed = sanitizeEnrichment(JSON.parse(jsonMatch[0]));
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(jsonMatch[0]);
+  } catch {
+    console.error("[enrichment] response JSON failed to parse, skipping");
+    return;
+  }
+  const parsed = sanitizeEnrichment(parsedJson);
   if (!parsed) {
     console.error("[enrichment] response JSON was not an object, skipping");
     return;

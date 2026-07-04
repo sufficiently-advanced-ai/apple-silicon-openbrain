@@ -11,6 +11,10 @@ import { detectLineage } from "../src/services/lineage.js";
 
 const limitArg = process.argv.indexOf("--limit");
 const limit = limitArg >= 0 ? Number(process.argv[limitArg + 1]) : null;
+if (limit !== null && (!Number.isFinite(limit) || limit <= 0)) {
+  console.error(`[backfill-lineage] invalid --limit value: ${process.argv[limitArg + 1]}`);
+  process.exit(1);
+}
 
 const rows = (await pg`
   SELECT id, content, source, source_id AS "sourceId"

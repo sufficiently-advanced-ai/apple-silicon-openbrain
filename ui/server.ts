@@ -291,18 +291,23 @@ Bun.serve({
         if (pairs.length > 100) return json({ error: "too many pairs (max 100)" }, 400);
         const resolved: string[] = [];
         for (const p of pairs) {
-          const parsed = ReviewMemorySchema.parse({
-            id: p.keepId,
-            action: "supersede",
-            relatedId: p.supersedeId,
-            notes: body.notes,
-          });
-          const result = await reviewMemory(parsed, { actor: "user" });
-          if ("error" in result) {
-            if (pairs.length === 1) return json(result, 400);
+          try {
+            const parsed = ReviewMemorySchema.parse({
+              id: p.keepId,
+              action: "supersede",
+              relatedId: p.supersedeId,
+              notes: body.notes,
+            });
+            const result = await reviewMemory(parsed, { actor: "user" });
+            if ("error" in result) {
+              if (pairs.length === 1) return json(result, 400);
+              continue;
+            }
+            resolved.push(p.supersedeId!);
+          } catch (e) {
+            if (pairs.length === 1) return json({ error: (e as Error).message }, 400);
             continue;
           }
-          resolved.push(p.supersedeId!);
         }
         return json({ resolved, count: resolved.length });
       } catch (err) {
