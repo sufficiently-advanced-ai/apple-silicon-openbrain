@@ -12,11 +12,12 @@ Conventions (must not drift — the Hermes Daily Scan feeds depend on them):
   - `source` and `source_id` pass through VERBATIM (mail / youtube / web +
     URL or message-id). scan_canvas.imi_captures(source=...) queries imi by
     these names, and imi dedups on source_id so re-forwarding is idempotent.
-  - Content is the enrichment summary when present, else truncated raw
-    content. Since 2026-08-20 openbrain enrichment is disabled
-    (DISABLE_ENRICHMENT) so in practice raw content flows through and imi's
-    own capture enrichment generates the summary (capture.summary field) —
-    imi is the sole summarizer.
+  - Content is the FULL stored content (since 2026-09-26: main-content
+    extracted at poll time, see src/services/extract.ts). Never the summary
+    and never truncated: imi cleans, admits (record/library lane), summarizes
+    and embeds it. Only a runaway body is capped (MAX_CONTENT_CHARS).
+  - Gmail system labels (UNREAD, INBOX, CATEGORY_*) are mailbox state, not
+    topics; they are not forwarded as tags.
   - Rows with no source_id get `openbrain:<uuid>` so idempotency still holds.
 
 Watermark on created_at, stored next to this repo; only advances past rows
@@ -26,6 +27,7 @@ Stdlib only — postgres is read via psql/row_to_json, no driver needed.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -42,8 +44,8 @@ STATE_PATH = Path("/Users/scott/Developer/openbrain/.imi_forward_state.json")
 # Absolute path: launchd's PATH doesn't include /opt/homebrew/bin.
 PSQL = ["/opt/homebrew/bin/psql", "-h", "localhost", "-p", "5432", "-U", "scott", "-d", "openbrain", "-t", "-A"]
 BATCH_LIMIT = 300          # per run; launchd re-fires in 15 min anyway
-MAX_CONTENT_CHARS = 4000   # fallback truncation when a row has no summary
-REQUEST_TIMEOUT = 15       # imi persists (sync) before enriching; don't wait out a jammed enrichment queue
+MAX_CONTENT_CHARS = 400_000  # runaway guard only (long transcripts are ~350k); imi accepts 10 MB
+REQUEST_TIMEOUT = 30       # imi persists (sync) before enriching; full bodies take longer than summaries did
 PACE_SECONDS = 0.2         # ~5 req/s, under imi's 10 req/s rate limit
 
 
@@ -104,15 +106,23 @@ def sanitize(text: str) -> str:
     return text
 
 
+_GMAIL_SYSTEM_LABEL = re.compile(
+    r"^(UNREAD|INBOX|IMPORTANT|STARRED|SENT|DRAFT|SPAM|TRASH|CHAT|CATEGORY_[A-Z_]+|Label_\d+)$"
+)
+
+
 def build_payload(row: dict) -> dict:
-    body = (row.get("summary") or "").strip()
-    if not body:
-        body = (row.get("content") or "").strip()[:MAX_CONTENT_CHARS]
+    # Full content, never the summary: imi is the sole summarizer and needs
+    # the text itself to judge, clean and embed it.
+    body = (row.get("content") or row.get("summary") or "").strip()[:MAX_CONTENT_CHARS]
     body = sanitize(body)
     source_id = row.get("source_id") or f"openbrain:{row['id']}"
     if source_id.startswith("http") and source_id not in body:
         body += f"\n\nSource URL: {source_id}"
-    tags = [t for t in (row.get("tags") or []) if isinstance(t, str)]
+    tags = [
+        t for t in (row.get("tags") or [])
+        if isinstance(t, str) and not _GMAIL_SYSTEM_LABEL.match(t)
+    ]
     return {
         "content": body,
         "source": row.get("source") or "openbrain",

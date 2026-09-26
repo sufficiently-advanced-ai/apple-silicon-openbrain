@@ -18,15 +18,19 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "@mozilla/readability": "^0.6.0",
     "drizzle-orm": "^0.44.2",
     "fast-xml-parser": "^4.5.0",
     "ioredis": "^5.6.1",
+    "linkedom": "^0.18.13",
     "pgvector": "^0.2.0",
     "postgres": "^3.4.7",
+    "turndown": "^7.2.4",
     "zod": "^3.25.3"
   },
   "devDependencies": {
     "@types/bun": "^1.2.10",
+    "@types/turndown": "^5.0.6",
     "drizzle-kit": "^0.31.1",
     "typescript": "^5.8.3"
   }

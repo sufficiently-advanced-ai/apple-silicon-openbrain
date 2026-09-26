@@ -1,4 +1,5 @@
 import { db } from "../db/client.js";
+import { emailHtmlToMarkdown, topicLabels } from "./extract.js";
 import { memories, type sources } from "../db/schema.js";
 import { eq, and, isNull } from "drizzle-orm";
 import { storeMemory } from "../tools/StoreMemory.js";
@@ -119,6 +120,28 @@ function stripHtml(html: string): string {
     .trim();
 }
 
+/** Body as markdown for storage: the HTML part through main-content
+ * extraction (Readability), else plain text. */
+function extractBodyMarkdown(payload: Payload): string {
+  const html = findPart(payload, "text/html");
+  if (html?.body?.data) {
+    const markdown = emailHtmlToMarkdown(decodeBase64Url(html.body.data));
+    if (markdown.trim()) return markdown;
+  }
+  return extractBody(payload);
+}
+
+function findPart(payload: Payload, mimeType: string): Payload | undefined {
+  if (payload.mimeType === mimeType && payload.body?.data) return payload;
+  for (const part of payload.parts ?? []) {
+    const found = findPart(part, mimeType);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/** Legacy flattened text (hrefs dropped). Still used for followLinks so link
+ * discovery doesn't start picking up every tracking link in a newsletter. */
 function extractBody(payload: Payload): string {
   if (payload.mimeType === "text/plain" && payload.body?.data) {
     return decodeBase64Url(payload.body.data);
@@ -201,9 +224,11 @@ export async function syncMailSource(source: SourceRow): Promise<{ ingested: num
       const subject = getHeader(msg.payload.headers, "Subject") || thread.subject || "(no subject)";
       const from = getHeader(msg.payload.headers, "From") || thread.from || "(unknown)";
       const date = getHeader(msg.payload.headers, "Date") || thread.date;
-      const body = extractBody(msg.payload) || msg.snippet || "(empty body)";
+      const body = extractBodyMarkdown(msg.payload) || msg.snippet || "(empty body)";
 
-      const content = `# ${subject}\n\nFrom: ${from}\nDate: ${date}\nAccount: ${account}\nLabels: ${(msg.labelIds ?? []).join(", ") || "(none)"}\n\n---\n\n${body}`;
+      // Gmail system labels (UNREAD, INBOX, CATEGORY_*) are mailbox state, not
+      // content: kept out of the text and the tags.
+      const content = `# ${subject}\n\nFrom: ${from}\nDate: ${date}\nAccount: ${account}\n\n---\n\n${body}`;
 
       // internalDate is Gmail's ms-epoch receipt time; fall back to the Date
       // header. Either way the memory carries when the mail arrived, not when
@@ -221,7 +246,7 @@ export async function syncMailSource(source: SourceRow): Promise<{ ingested: num
           source: "mail",
           sourceId: msg.id,
           memoryType: "fact",
-          tags: msg.labelIds ?? [],
+          tags: topicLabels(msg.labelIds),
           sourceDate: receivedAt,
         },
         { createdBy: "import" },
@@ -230,7 +255,7 @@ export async function syncMailSource(source: SourceRow): Promise<{ ingested: num
 
       // If followLinks is enabled, extract and ingest each linked article
       if (cfg.followLinks) {
-        const links = extractLinks(body);
+        const links = extractLinks(extractBody(msg.payload));
         for (const link of links) {
           try {
             const r = await ingestUrl(link);
