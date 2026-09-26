@@ -65,3 +65,27 @@ describe("topicLabels", () => {
     expect(topicLabels(undefined)).toEqual([]);
   });
 });
+
+describe("prose fallback", () => {
+  test("minimal page with text directly in <body> is extracted", () => {
+    const body = Array.from({ length: 12 }, (_, i) => `<p>Paragraph ${i} of a hand-written essay about bug blindness and why people stop seeing defects they walk past every day.</p>`).join("");
+    const html = `<html><head><title>Bug blind</title></head><body><a href="/">home</a>${body}</body></html>`;
+    const ex = extractMainContent(html, "https://danluu.com/bug-blind/");
+    expect(ex).not.toBeNull();
+    expect(ex!.markdown).toContain("Paragraph 11 of a hand-written essay");
+  });
+
+  test("link-heavy pages never take the fallback", () => {
+    const links = Array.from({ length: 80 }, (_, i) => `<a href="/p/${i}">Post number ${i} in the archive list</a><br>`).join("");
+    expect(extractMainContent(`<html><body>${links}</body></html>`)).toBeNull();
+  });
+});
+
+test("pages that omit the optional <head>/<body> tags still extract", () => {
+  const paras = Array.from({ length: 12 }, (_, i) => `<p>Paragraph ${i} of an essay published without optional tags, which HTML5 allows and some minimalist blogs use.`).join("\n");
+  const html = `<!DOCTYPE html><html lang=en><meta charset=utf-8><title>Bug blindness</title><style>p{}</style><a href=/>home</a>\n${paras}`;
+  const ex = extractMainContent(html, "https://danluu.com/bug-blind/");
+  expect(ex).not.toBeNull();
+  expect(ex!.markdown).toContain("Paragraph 11 of an essay");
+  expect(ex!.markdown).not.toContain("p{}");
+});

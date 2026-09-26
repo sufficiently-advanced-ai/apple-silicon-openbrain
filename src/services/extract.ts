@@ -20,6 +20,35 @@ export interface Extracted {
 
 /** Below this, Readability probably picked the wrong block — callers fall back. */
 export const MIN_EXTRACTED_CHARS = 400;
+/** Whole-body fallback only for pages that are mostly prose: minimal
+ * hand-written pages (text directly in <body>) where Readability finds no
+ * container to score, and which have little chrome to begin with. */
+const FALLBACK_MIN_CHARS = 1500;
+const FALLBACK_MAX_LINK_RATIO = 0.25;
+
+/** Share of the visible text that sits inside links. An index/archive page
+ * is mostly links; an article is mostly prose. */
+export function linkTextRatio(markdown: string): number {
+  const links = [...markdown.matchAll(/\[([^\]]*)\]\([^)]*\)/g)];
+  const linkChars = links.reduce((n, m) => n + m[1].length, 0);
+  const visible = markdown.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/\s+/g, " ").trim().length;
+  return visible ? linkChars / visible : 0;
+}
+const MAX_ARTICLE_LINK_RATIO = 0.5;
+
+function proseBodyFallback(document: Document): string | null {
+  const body = document.body;
+  if (!body) return null;
+  for (const el of Array.from(body.querySelectorAll("nav, header, footer, aside, script, style, form"))) el.remove();
+  const text = (body.textContent ?? "").replace(/\s+/g, " ").trim();
+  if (text.length < FALLBACK_MIN_CHARS) return null;
+  const linkText = Array.from(body.querySelectorAll("a"))
+    .map((a) => (a.textContent ?? "").replace(/\s+/g, " ").trim().length)
+    .reduce((x, y) => x + y, 0);
+  if (linkText / text.length > FALLBACK_MAX_LINK_RATIO) return null;
+  const markdown = htmlToMarkdown(body.innerHTML);
+  return markdown.length >= MIN_EXTRACTED_CHARS ? markdown : null;
+}
 
 const turndown = new TurndownService({
   headingStyle: "atx",
@@ -39,6 +68,30 @@ const EMPTY_LINK = /\[\s*\]\([^)]*\)/g;
 
 // Invisible preheader text and tracking pixels common in newsletter HTML.
 const HIDDEN = /display\s*:\s*none|visibility\s*:\s*hidden|max-height\s*:\s*0|mso-hide\s*:\s*all/i;
+
+/** HTML5 lets a page omit <head>/<body> (minimalist blogs do). linkedom then
+ * leaves an empty <body> with the content as its siblings under <html>, and
+ * Readability finds nothing (or crashes). Move stray content into <body>. */
+function normalizeBody(document: Document): void {
+  const root = document.documentElement;
+  const body = document.body;
+  if (!root || !body || (body.textContent ?? "").trim()) return;
+  for (const node of Array.from(root.childNodes)) {
+    const name = node.nodeName.toLowerCase();
+    if (name === "head" || name === "body") continue;
+    if (["title", "meta", "link", "style", "script", "base"].includes(name)) {
+      document.head?.appendChild(node);
+    } else {
+      body.appendChild(node);
+    }
+  }
+}
+
+function parse(html: string): Document {
+  const document = parseHTML(html).document as unknown as Document;
+  normalizeBody(document);
+  return document;
+}
 
 function stripHidden(document: Document): void {
   for (const el of Array.from(document.querySelectorAll("[style]"))) {
@@ -67,24 +120,36 @@ export function tidy(markdown: string): string {
 export function extractMainContent(html: string, url?: string): Extracted | null {
   if (!html || !html.trim()) return null;
   try {
-    const { document } = parseHTML(html);
-    stripHidden(document as unknown as Document);
+    const document = parse(html);
+    stripHidden(document);
     // Readability resolves relative links against the document URL.
     if (url) {
       const base = document.createElement("base");
       base.setAttribute("href", url);
       document.head?.appendChild(base);
     }
-    const article = new Readability(document as unknown as Document, { charThreshold: 200 }).parse();
-    if (!article?.content) return null;
-    const markdown = htmlToMarkdown(article.content);
-    if (markdown.length < MIN_EXTRACTED_CHARS) return null;
-    return {
-      title: (article.title ?? "").trim(),
-      markdown,
-      byline: article.byline?.trim() || undefined,
-      publishedTime: article.publishedTime?.trim() || undefined,
-    };
+    // Readability mutates the document; keep a pristine copy for the fallback.
+    const pristine = parse(html);
+    let article: ReturnType<Readability["parse"]> = null;
+    try {
+      article = new Readability(document, { charThreshold: 200 }).parse();
+    } catch (err) {
+      console.warn(`[extract] Readability failed${url ? ` for ${url}` : ""}, trying prose fallback: ${err}`);
+    }
+    const markdown = article?.content ? htmlToMarkdown(article.content) : "";
+    if (article && markdown.length >= MIN_EXTRACTED_CHARS) {
+      if (linkTextRatio(markdown) > MAX_ARTICLE_LINK_RATIO) return null; // an index page, not an article
+      return {
+        title: (article.title ?? "").trim(),
+        markdown,
+        byline: article.byline?.trim() || undefined,
+        publishedTime: article.publishedTime?.trim() || undefined,
+      };
+    }
+    stripHidden(pristine);
+    const fallback = proseBodyFallback(pristine);
+    if (!fallback) return null;
+    return { title: (pristine.title ?? "").trim(), markdown: fallback };
   } catch (err) {
     console.warn(`[extract] Readability failed${url ? ` for ${url}` : ""}: ${err}`);
     return null;
@@ -103,8 +168,8 @@ export function emailHtmlToMarkdown(html: string): string {
   if (main) {
     markdown = main.markdown;
   } else {
-    const { document } = parseHTML(html);
-    stripHidden(document as unknown as Document);
+    const document = parse(html);
+    stripHidden(document);
     markdown = htmlToMarkdown(document.body?.innerHTML ?? html);
   }
   const lines = markdown.split("\n");
