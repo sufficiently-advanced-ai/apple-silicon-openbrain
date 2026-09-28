@@ -1,7 +1,7 @@
 import { db } from "../db/client.js";
 import { memories } from "../db/schema.js";
 import { eq, and, isNull } from "drizzle-orm";
-import { scrapeUrl } from "./scrape.js";
+import { scrapeUrl, storableText } from "./scrape.js";
 import { isYouTubeUrl, fetchYouTubeTranscript } from "./youtube.js";
 import { storeMemory } from "../tools/StoreMemory.js";
 
@@ -56,7 +56,7 @@ export async function ingestUrl(
   const scraped = await scrapeUrl(targetUrl);
   const result = await storeMemory(
     {
-      content: scraped.markdown,
+      content: storableText(scraped),
       source: "web",
       sourceId: targetUrl,
       memoryType: "fact",

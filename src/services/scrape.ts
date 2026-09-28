@@ -1,12 +1,24 @@
 import { config } from "../lib/config.js";
+import { extractMainContent, type Extracted } from "./extract.js";
 
 const FIRECRAWL_API = "https://api.firecrawl.dev/v1";
 
 export interface ScrapeResult {
   title: string;
+  /** Firecrawl's full-page markdown, navigation included. Landing-page link
+   * discovery (sourceSync) depends on it, so it is never replaced. */
   markdown: string;
+  /** Main content extracted from the rendered HTML (Readability), or null
+   * when extraction found no plausible article. What gets stored. */
+  article: Extracted | null;
   url: string;
   source: "firecrawl";
+}
+
+/** The text to store for a scraped page: the extracted article when there is
+ * one, else Firecrawl's markdown. */
+export function storableText(scraped: ScrapeResult): string {
+  return scraped.article?.markdown ?? scraped.markdown;
 }
 
 export async function scrapeUrl(url: string): Promise<ScrapeResult> {
@@ -20,7 +32,9 @@ export async function scrapeUrl(url: string): Promise<ScrapeResult> {
       "Content-Type": "application/json",
       Authorization: `Bearer ${config.firecrawlApiKey}`,
     },
-    body: JSON.stringify({ url, formats: ["markdown"] }),
+    // rawHtml is the JS-rendered page; main-content extraction runs on it
+    // locally. Same credit cost as markdown alone.
+    body: JSON.stringify({ url, formats: ["markdown", "rawHtml"] }),
   });
 
   if (!res.ok) {
@@ -32,6 +46,7 @@ export async function scrapeUrl(url: string): Promise<ScrapeResult> {
     success: boolean;
     data?: {
       markdown?: string;
+      rawHtml?: string;
       metadata?: { title?: string; sourceURL?: string };
     };
     error?: string;
@@ -41,12 +56,18 @@ export async function scrapeUrl(url: string): Promise<ScrapeResult> {
     throw new Error(`Firecrawl scrape failed: ${data.error ?? "unknown error"}`);
   }
 
+  const finalUrl = data.data?.metadata?.sourceURL ?? url;
+  const article = extractMainContent(data.data?.rawHtml ?? "", finalUrl);
   const result: ScrapeResult = {
-    title: data.data?.metadata?.title ?? url,
+    title: article?.title || data.data?.metadata?.title || url,
     markdown: data.data?.markdown ?? "",
-    url: data.data?.metadata?.sourceURL ?? url,
+    article,
+    url: finalUrl,
     source: "firecrawl",
   };
-  console.log(`[scrape] Firecrawl succeeded for ${url} (${result.markdown.length} chars)`);
+  console.log(
+    `[scrape] Firecrawl succeeded for ${url} (${result.markdown.length} chars page, ` +
+      `${article ? `${article.markdown.length} chars article` : "no article extracted"})`,
+  );
   return result;
 }
