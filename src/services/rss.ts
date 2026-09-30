@@ -24,13 +24,40 @@ function feedDate(raw: unknown): string | undefined {
   return Number.isNaN(ms) ? undefined : new Date(ms).toISOString();
 }
 
+/**
+ * Feed elements holding a full post or video body. We never read these (see
+ * extractItems), but their escaped markup is ~99% of every entity reference in a
+ * typical feed: across the live source set, <summary> and <media:description>
+ * account for 5691 of 5700 expansions while the fields we do read account for 9.
+ *
+ * Entity processing is gated per-tag *before* the expansion counter is
+ * incremented, so skipping these keeps the budget proportional to the fields we
+ * actually use rather than to how much people wrote this week.
+ */
+const CONTENT_TAGS = new Set([
+  "summary",
+  "content",
+  "content:encoded",
+  "description",
+  "media:description", // YouTube feeds put the whole video description here
+  "itunes:summary",
+  "itunes:subtitle",
+  "dc:description",
+]);
+
 const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
   // Convert single-element arrays into actual arrays so we can iterate uniformly.
   isArray: (name) => ["item", "entry"].includes(name),
-  // Simon Willison's feed has >1000 entity expansions; raise the default cap.
+  // Feed titles routinely carry numeric refs for curly quotes and accents
+  // (&#8217;, &#233;); without this they reach memory as literal "&#8217;".
+  htmlEntities: true,
   processEntities: {
+    // Decode entities everywhere except the bodies we discard. Raising the cap
+    // instead is a treadmill: it was already bumped 1000 -> 5000 and the feed
+    // outgrew it again.
+    tagFilter: (tagName) => !CONTENT_TAGS.has(tagName),
     maxTotalExpansions: 5000,
   },
 });
@@ -79,6 +106,11 @@ function extractItems(feed: unknown): FeedItem[] {
   return [];
 }
 
+/** Parse feed XML into items. Split from the fetch so it is testable offline. */
+export function parseFeed(xml: string): FeedItem[] {
+  return extractItems(parser.parse(xml));
+}
+
 export async function fetchAndParseFeed(feedUrl: string): Promise<FeedItem[]> {
   const res = await fetch(feedUrl, {
     headers: { "user-agent": "openbrain-rss/1.0 (+https://github.com/sajennings79/apple-silicon-openbrain)" },
@@ -87,9 +119,7 @@ export async function fetchAndParseFeed(feedUrl: string): Promise<FeedItem[]> {
   if (!res.ok) {
     throw new Error(`feed fetch failed: ${res.status} ${res.statusText}`);
   }
-  const xml = await res.text();
-  const parsed = parser.parse(xml);
-  return extractItems(parsed);
+  return parseFeed(await res.text());
 }
 
 export async function syncRssSource(source: SourceRow): Promise<{ ingested: number; duplicates: number }> {
